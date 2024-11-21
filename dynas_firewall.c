@@ -1,3 +1,5 @@
+#ifndef HEADER_FILE_NAME_H
+#define HEADER_FILE_NAME_H
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -5,11 +7,12 @@
 #include <unistd.h>
 #include <time.h>
 #include <libnetfilter_queue/libnetfilter_queue.h>
-#include <netinet/ip.h>
-#include <netinet/tcp.h>
-#include <netinet/udp.h>
-#include <arpa/inet.h>
+#include <netinet/ip.h>  // Define struct iphdr
+#include <netinet/tcp.h> // Define struct tcphdr
+#include <netinet/udp.h> // Define struct udphdr
+#include <arpa/inet.h>   // Funções para manipulação de IPs
 #include <linux/netfilter.h>
+#endif
 
 #define CONFIG_FILE "firewall_rules.conf"
 #define LOG_FILE "/var/log/firewall.log"
@@ -132,6 +135,18 @@ static int process_packet(struct nfq_q_handle *queue_handle, struct nfgenmsg *ms
     if (ph) {
         id = ntohl(ph->packet_id);
     }
+
+    struct tcphdr {
+        uint16_t source;  // Porta de origem
+        uint16_t dest;    // Porta de destino
+        uint32_t seq;     // Número de sequência
+        uint32_t ack_seq; // Número de confirmação
+        uint16_t res1 : 4, doff : 4, fin : 1, syn : 1, rst : 1, psh : 1, ack : 1, urg : 1, res2 : 2;
+        uint16_t window;  // Tamanho da janela
+        uint16_t check;   // Soma de verificação
+        uint16_t urg_ptr; // Ponteiro urgente
+    };
+
 
     int packet_len = nfq_get_payload(packet_data, &packet);
     if (packet_len >= 0) {
