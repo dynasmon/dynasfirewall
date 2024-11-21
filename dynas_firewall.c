@@ -2,31 +2,36 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 #include <libnetfilter_queue/libnetfilter_queue.h>
-#include <netinet/ip.h>       // Para cabeçalhos IP
-#include <netinet/tcp.h>      // Para cabeçalhos TCP
-#include <netinet/udp.h>      // Para cabeçalhos UDP
-#include <arpa/inet.h>        // Para funções de conversão de endereços IP
-#include <linux/netfilter.h>  // Para macros NF_DROP e NF_ACCEPT
-
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
+#include <arpa/inet.h>
+#include <linux/netfilter.h>
 
 #define CONFIG_FILE "firewall_rules.conf"
 #define LOG_FILE "/var/log/firewall.log"
+#define MAX_RULES 100
 
-// Estrutura para armazenar regras dinâmicas
+// Estrutura para armazenar regras
 typedef struct {
-    char src_ip[16];
-    char dst_ip[16];
+    char src_ip[40];
+    char dst_ip[40];
     int src_port;
     int dst_port;
     char protocol[8];
     int action; // 0: DROP, 1: ACCEPT
+    char start_time[6]; // Hora de início (HH:MM)
+    char end_time[6];   // Hora de fim (HH:MM)
 } Rule;
 
-// Lista de regras dinâmicas
-#define MAX_RULES 100
 Rule rules[MAX_RULES];
 int rule_count = 0;
+
+// Estatísticas
+int packets_blocked = 0;
+int packets_accepted = 0;
 
 // Função para carregar regras do arquivo
 void load_rules() {
@@ -37,10 +42,11 @@ void load_rules() {
     }
 
     rule_count = 0;
-    while (fscanf(config, "%15s %15s %d %d %7s %d",
+    while (fscanf(config, "%39s %39s %d %d %7s %d %5s %5s",
                   rules[rule_count].src_ip, rules[rule_count].dst_ip,
                   &rules[rule_count].src_port, &rules[rule_count].dst_port,
-                  rules[rule_count].protocol, &rules[rule_count].action) != EOF) {
+                  rules[rule_count].protocol, &rules[rule_count].action,
+                  rules[rule_count].start_time, rules[rule_count].end_time) != EOF) {
         rule_count++;
         if (rule_count >= MAX_RULES) {
             fprintf(stderr, "Número máximo de regras excedido\n");
@@ -64,12 +70,18 @@ void log_blocked_packet(const char *src_ip, const char *dst_ip, const char *prot
 
 // Função para verificar regras
 int check_rules(const char *src_ip, const char *dst_ip, int src_port, int dst_port, const char *protocol) {
+    time_t now = time(NULL);
+    struct tm *local_time = localtime(&now);
+    char current_time[6];
+    snprintf(current_time, sizeof(current_time), "%02d:%02d", local_time->tm_hour, local_time->tm_min);
+
     for (int i = 0; i < rule_count; i++) {
         if ((strcmp(rules[i].src_ip, "*") == 0 || strcmp(rules[i].src_ip, src_ip) == 0) &&
             (strcmp(rules[i].dst_ip, "*") == 0 || strcmp(rules[i].dst_ip, dst_ip) == 0) &&
             (rules[i].src_port == 0 || rules[i].src_port == src_port) &&
             (rules[i].dst_port == 0 || rules[i].dst_port == dst_port) &&
-            (strcmp(rules[i].protocol, "*") == 0 || strcmp(rules[i].protocol, protocol) == 0)) {
+            (strcmp(rules[i].protocol, "*") == 0 || strcmp(rules[i].protocol, protocol) == 0) &&
+            (strcmp(current_time, rules[i].start_time) >= 0 && strcmp(current_time, rules[i].end_time) <= 0)) {
             return rules[i].action;
         }
     }
@@ -91,7 +103,7 @@ static int process_packet(struct nfq_q_handle *queue_handle, struct nfgenmsg *ms
     int packet_len = nfq_get_payload(packet_data, &packet);
     if (packet_len >= 0) {
         struct iphdr *ip_header = (struct iphdr *)packet;
-        char src_ip[16], dst_ip[16];
+        char src_ip[40], dst_ip[40];
         inet_ntop(AF_INET, &ip_header->saddr, src_ip, sizeof(src_ip));
         inet_ntop(AF_INET, &ip_header->daddr, dst_ip, sizeof(dst_ip));
 
@@ -108,15 +120,15 @@ static int process_packet(struct nfq_q_handle *queue_handle, struct nfgenmsg *ms
             struct udphdr *udp_header = (struct udphdr *)(packet + ip_header->ihl * 4);
             src_port = ntohs(udp_header->source);
             dst_port = ntohs(udp_header->dest);
-        } else if (ip_header->protocol == IPPROTO_ICMP) {
-            strcpy(protocol, "ICMP");
         }
 
         int action = check_rules(src_ip, dst_ip, src_port, dst_port, protocol);
         if (action == 0) { // DROP
             log_blocked_packet(src_ip, dst_ip, protocol, src_port, dst_port);
+            packets_blocked++;
             return nfq_set_verdict(queue_handle, id, NF_DROP, 0, NULL);
         }
+        packets_accepted++;
     }
 
     return nfq_set_verdict(queue_handle, id, NF_ACCEPT, 0, NULL);
@@ -166,6 +178,9 @@ int main() {
 
     nfq_destroy_queue(queue_handle);
     nfq_close(handle);
+
+    printf("Pacotes bloqueados: %d\n", packets_blocked);
+    printf("Pacotes aceitos: %d\n", packets_accepted);
 
     return 0;
 }
