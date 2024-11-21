@@ -1,3 +1,4 @@
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +14,7 @@
 #define CONFIG_FILE "firewall_rules.conf"
 #define LOG_FILE "/var/log/firewall.log"
 #define MAX_RULES 100
+
 
 // Estrutura para armazenar regras
 typedef struct {
@@ -71,6 +73,28 @@ printf("Blocked packet: Src=%s, Dst=%s, Protocol=%s, SrcPort=%d, DstPort=%d\n",
 
 }
 
+void save_statistics() {
+    FILE *file = fopen("firewall_stats.dat", "w");
+    if (file) {
+        fprintf(file, "%d %d\n", packets_blocked, packets_accepted);
+        fclose(file);
+    } else {
+        perror("Erro ao salvar estatísticas");
+    }
+}
+
+void load_statistics() {
+    FILE *file = fopen("firewall_stats.dat", "r");
+    if (file) {
+        fscanf(file, "%d %d", &packets_blocked, &packets_accepted);
+        fclose(file);
+    } else {
+        packets_blocked = 0;
+        packets_accepted = 0;
+    }
+}
+
+
 // Função para verificar regras
 int check_rules(const char *src_ip, const char *dst_ip, int src_port, int dst_port, const char *protocol) {
     time_t now = time(NULL);
@@ -87,6 +111,12 @@ int check_rules(const char *src_ip, const char *dst_ip, int src_port, int dst_po
             (strcmp(current_time, rules[i].start_time) >= 0 && strcmp(current_time, rules[i].end_time) <= 0)) {
             return rules[i].action;
         }
+        printf("Comparando pacote: Src=%s, Dst=%s, SrcPort=%d, DstPort=%d, Protocol=%s\n",
+        src_ip, dst_ip, src_port, dst_port, protocol);
+        printf("Regra atual: Src=%s, Dst=%s, SrcPort=%d, DstPort=%d, Protocol=%s, Action=%d\n",
+        rules[i].src_ip, rules[i].dst_ip, rules[i].src_port, rules[i].dst_port,
+        rules[i].protocol, rules[i].action);
+
     }
     return 1; // Default: ACCEPT
 }
@@ -119,30 +149,52 @@ static int process_packet(struct nfq_q_handle *queue_handle, struct nfgenmsg *ms
             src_port = ntohs(tcp_header->source);
             dst_port = ntohs(tcp_header->dest);
         } else if (ip_header->protocol == IPPROTO_UDP) {
-            strcpy(protocol, "UDP");
-            struct udphdr *udp_header = (struct udphdr *)(packet + ip_header->ihl * 4);
-            src_port = ntohs(udp_header->source);
-            dst_port = ntohs(udp_header->dest);
-        }
+                strcpy(protocol, "UDP");
+                struct udphdr *udp_header = (struct udphdr *)(packet + ip_header->ihl * 4);
+                src_port = ntohs(udp_header->source);
+                dst_port = ntohs(udp_header->dest);
+            } else {
+                strcpy(protocol, "OTHER");
+            }
+
+
+        printf("Processing packet: Src=%s, Dst=%s, Protocol=%s, SrcPort=%d, DstPort=%d\n",
+               src_ip, dst_ip, protocol, src_port, dst_port);
 
         int action = check_rules(src_ip, dst_ip, src_port, dst_port, protocol);
         if (action == 0) { // DROP
             log_blocked_packet(src_ip, dst_ip, protocol, src_port, dst_port);
             packets_blocked++;
+            printf("Packet blocked. Total blocked: %d\n", packets_blocked);
             return nfq_set_verdict(queue_handle, id, NF_DROP, 0, NULL);
         }
         packets_accepted++;
+        printf("Packet accepted. Total accepted: %d\n", packets_accepted);
     }
 
     return nfq_set_verdict(queue_handle, id, NF_ACCEPT, 0, NULL);
 }
 
+#include <signal.h>
+
+void handle_sigint(int sig) {
+    save_statistics();
+    printf("\nFirewall interrompido.\n");
+    printf("Pacotes bloqueados: %d\n", packets_blocked);
+    printf("Pacotes aceitos: %d\n", packets_accepted);
+    exit(0);
+}
+
+
 int main() {
     struct nfq_handle *handle;
     struct nfq_q_handle *queue_handle;
 
+    signal(SIGINT, handle_sigint); // Função para capturar Ctrl+C
+
     printf("Inicializando firewall...\n");
 
+    load_statistics(); // Carregar estatísticas salvas
     load_rules();
 
     handle = nfq_open();
@@ -182,8 +234,8 @@ int main() {
     nfq_destroy_queue(queue_handle);
     nfq_close(handle);
 
-    printf("Pacotes bloqueados: %d\n", packets_blocked);
-    printf("Pacotes aceitos: %d\n", packets_accepted);
+    save_statistics(); // Salvar estatísticas antes de sair
 
     return 0;
 }
+
