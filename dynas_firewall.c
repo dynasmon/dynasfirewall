@@ -59,13 +59,16 @@ void load_rules() {
 
 // Função para registrar logs
 void log_blocked_packet(const char *src_ip, const char *dst_ip, const char *protocol, int src_port, int dst_port) {
-    FILE *log_file = fopen(LOG_FILE, "a");
-    if (!log_file) {
-        perror("Erro ao abrir arquivo de log");
-        return;
-    }
-    fprintf(log_file, "Bloqueado: Src=%s:%d Dst=%s:%d Protocol=%s\n", src_ip, src_port, dst_ip, dst_port, protocol);
+    FILE *log_file = fopen("/var/log/firewall.log", "a");
+if (log_file) {
+    fprintf(log_file, "Blocked packet: Src=%s, Dst=%s, Protocol=%s\n", src_ip, dst_ip, protocol);
     fclose(log_file);
+}
+
+printf("Blocked packet: Src=%s, Dst=%s, Protocol=%s, SrcPort=%d, DstPort=%d\n",
+       src_ip, dst_ip, protocol, src_port, dst_port);
+
+
 }
 
 // Função para verificar regras
