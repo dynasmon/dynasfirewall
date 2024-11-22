@@ -1,23 +1,20 @@
-#ifndef HEADER_FILE_NAME_H
-#define HEADER_FILE_NAME_H
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
+#include <pthread.h>
 #include <libnetfilter_queue/libnetfilter_queue.h>
-#include <netinet/ip.h>  // Define struct iphdr
-#include <netinet/tcp.h> // Define struct tcphdr
-#include <netinet/udp.h> // Define struct udphdr
-#include <arpa/inet.h>   // Funções para manipulação de IPs
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
+#include <arpa/inet.h>
 #include <linux/netfilter.h>
-#endif
 
 #define CONFIG_FILE "firewall_rules.conf"
 #define LOG_FILE "/var/log/firewall.log"
 #define MAX_RULES 100
-
 
 // Estrutura para armazenar regras
 typedef struct {
@@ -31,14 +28,152 @@ typedef struct {
     char end_time[6];   // Hora de fim (HH:MM)
 } Rule;
 
-Rule rules[MAX_RULES];
-int rule_count = 0;
-
-// Estatísticas
+// Variáveis globais
 int packets_blocked = 0;
 int packets_accepted = 0;
+int rule_count = 0;
+int firewall_running = 1; // Flag para indicar o estado do firewall
+Rule rules[MAX_RULES];
 
-// Função para carregar regras do arquivo
+// Declarações de funções
+void load_rules();
+void save_statistics();
+void load_statistics();
+void log_blocked_packet(const char *src_ip, const char *dst_ip, const char *protocol, int src_port, int dst_port);
+void handle_sigint(int sig);
+void *interactive_menu(void *arg);
+int check_rules(const char *src_ip, const char *dst_ip, int src_port, int dst_port, const char *protocol);
+static int process_packet(struct nfq_q_handle *queue_handle, struct nfgenmsg *msg, struct nfq_data *packet_data, void *data);
+
+// Implementações de funções
+void load_statistics() {
+    FILE *file = fopen("firewall_stats.dat", "r");
+    if (file) {
+        fscanf(file, "%d %d", &packets_blocked, &packets_accepted);
+        fclose(file);
+    }
+}
+
+void save_statistics() {
+    FILE *file = fopen("firewall_stats.dat", "w");
+    if (file) {
+        fprintf(file, "%d %d\n", packets_blocked, packets_accepted);
+        fclose(file);
+    } else {
+        perror("Erro ao salvar estatísticas");
+    }
+}
+
+// Implementação do menu interativo
+void *interactive_menu(void *arg) {
+    char option;
+    while (1) {
+        printf("\n--- Firewall Menu ---\n");
+        printf("1. Ver estatísticas\n");
+        printf("2. Adicionar regra\n");
+        printf("3. Listar regras\n");
+        printf("4. Parar firewall\n");
+        printf("5. Retomar firewall\n");
+        printf("6. Sair\n");
+        printf("Escolha uma opção: ");
+        scanf(" %c", &option);
+
+        switch (option) {
+            case '1':
+                printf("\n--- Estatísticas ---\n");
+                printf("Pacotes bloqueados: %d\n", packets_blocked);
+                printf("Pacotes aceitos: %d\n", packets_accepted);
+                break;
+
+            case '2': {
+                Rule new_rule;
+                printf("\n--- Adicionar Regra ---\n");
+                printf("IP de origem (use * para qualquer): ");
+                scanf("%39s", new_rule.src_ip);
+                printf("IP de destino (use * para qualquer): ");
+                scanf("%39s", new_rule.dst_ip);
+                printf("Porta de origem (0 para qualquer): ");
+                scanf("%d", &new_rule.src_port);
+                printf("Porta de destino (0 para qualquer): ");
+                scanf("%d", &new_rule.dst_port);
+                printf("Protocolo (TCP, UDP ou *): ");
+                scanf("%7s", new_rule.protocol);
+                printf("Ação (0: DROP, 1: ACCEPT): ");
+                scanf("%d", &new_rule.action);
+                printf("Hora de início (HH:MM): ");
+                scanf("%5s", new_rule.start_time);
+                printf("Hora de término (HH:MM): ");
+                scanf("%5s", new_rule.end_time);
+
+                if (rule_count < MAX_RULES) {
+                    rules[rule_count++] = new_rule;
+                    printf("Regra adicionada com sucesso.\n");
+                } else {
+                    printf("Número máximo de regras atingido.\n");
+                }
+                break;
+            }
+
+            case '3':
+                printf("\n--- Regras Atuais ---\n");
+                for (int i = 0; i < rule_count; i++) {
+                    printf("%d. Src: %s, Dst: %s, SrcPort: %d, DstPort: %d, Protocol: %s, Action: %s, Time: %s-%s\n",
+                           i + 1, rules[i].src_ip, rules[i].dst_ip, rules[i].src_port, rules[i].dst_port,
+                           rules[i].protocol, rules[i].action ? "ACCEPT" : "DROP", rules[i].start_time, rules[i].end_time);
+                }
+                break;
+
+            case '4':
+                firewall_running = 0;
+                printf("Firewall pausado.\n");
+                break;
+
+            case '5':
+                firewall_running = 1;
+                printf("Firewall retomado.\n");
+                break;
+
+            case '6':
+                printf("Encerrando o firewall...\n");
+                save_statistics();
+                exit(0);
+
+            default:
+                printf("Opção inválida. Tente novamente.\n");
+                break;
+        }
+    }
+    return NULL;
+}
+
+static int process_packet(struct nfq_q_handle *queue_handle, struct nfgenmsg *msg,
+                          struct nfq_data *packet_data, void *data) {
+    unsigned char *packet;
+    struct nfqnl_msg_packet_hdr *ph;
+    int id = 0;
+
+    ph = nfq_get_msg_packet_hdr(packet_data);
+    if (ph) {
+        id = ntohl(ph->packet_id);
+    }
+
+    struct iphdr *ip_header = (struct iphdr *)packet;
+    char src_ip[40], dst_ip[40];
+    inet_ntop(AF_INET, &ip_header->saddr, src_ip, sizeof(src_ip));
+    inet_ntop(AF_INET, &ip_header->daddr, dst_ip, sizeof(dst_ip));
+
+    int action = check_rules(src_ip, dst_ip, 0, 0, "TCP"); // Exemplo básico
+    return nfq_set_verdict(queue_handle, id, action == 0 ? NF_DROP : NF_ACCEPT, 0, NULL);
+}
+
+void handle_sigint(int sig) {
+    save_statistics();
+    printf("\nFirewall interrompido.\n");
+    printf("Pacotes bloqueados: %d\n", packets_blocked);
+    printf("Pacotes aceitos: %d\n", packets_accepted);
+    exit(0);
+}
+
 void load_rules() {
     FILE *config = fopen(CONFIG_FILE, "r");
     if (!config) {
@@ -62,43 +197,6 @@ void load_rules() {
     printf("Regras carregadas: %d\n", rule_count);
 }
 
-// Função para registrar logs
-void log_blocked_packet(const char *src_ip, const char *dst_ip, const char *protocol, int src_port, int dst_port) {
-    FILE *log_file = fopen("/var/log/firewall.log", "a");
-if (log_file) {
-    fprintf(log_file, "Blocked packet: Src=%s, Dst=%s, Protocol=%s\n", src_ip, dst_ip, protocol);
-    fclose(log_file);
-}
-
-printf("Blocked packet: Src=%s, Dst=%s, Protocol=%s, SrcPort=%d, DstPort=%d\n",
-       src_ip, dst_ip, protocol, src_port, dst_port);
-
-
-}
-
-void save_statistics() {
-    FILE *file = fopen("firewall_stats.dat", "w");
-    if (file) {
-        fprintf(file, "%d %d\n", packets_blocked, packets_accepted);
-        fclose(file);
-    } else {
-        perror("Erro ao salvar estatísticas");
-    }
-}
-
-void load_statistics() {
-    FILE *file = fopen("firewall_stats.dat", "r");
-    if (file) {
-        fscanf(file, "%d %d", &packets_blocked, &packets_accepted);
-        fclose(file);
-    } else {
-        packets_blocked = 0;
-        packets_accepted = 0;
-    }
-}
-
-
-// Função para verificar regras
 int check_rules(const char *src_ip, const char *dst_ip, int src_port, int dst_port, const char *protocol) {
     time_t now = time(NULL);
     struct tm *local_time = localtime(&now);
@@ -124,93 +222,24 @@ int check_rules(const char *src_ip, const char *dst_ip, int src_port, int dst_po
     return 1; // Default: ACCEPT
 }
 
-// Função de callback para processar pacotes
-static int process_packet(struct nfq_q_handle *queue_handle, struct nfgenmsg *msg,
-                          struct nfq_data *packet_data, void *data) {
-    unsigned char *packet;
-    struct nfqnl_msg_packet_hdr *ph;
-    int id = 0;
 
-    ph = nfq_get_msg_packet_hdr(packet_data);
-    if (ph) {
-        id = ntohl(ph->packet_id);
-    }
-
-    struct tcphdr {
-        uint16_t source;  // Porta de origem
-        uint16_t dest;    // Porta de destino
-        uint32_t seq;     // Número de sequência
-        uint32_t ack_seq; // Número de confirmação
-        uint16_t res1 : 4, doff : 4, fin : 1, syn : 1, rst : 1, psh : 1, ack : 1, urg : 1, res2 : 2;
-        uint16_t window;  // Tamanho da janela
-        uint16_t check;   // Soma de verificação
-        uint16_t urg_ptr; // Ponteiro urgente
-    };
-
-
-    int packet_len = nfq_get_payload(packet_data, &packet);
-    if (packet_len >= 0) {
-        struct iphdr *ip_header = (struct iphdr *)packet;
-        char src_ip[40], dst_ip[40];
-        inet_ntop(AF_INET, &ip_header->saddr, src_ip, sizeof(src_ip));
-        inet_ntop(AF_INET, &ip_header->daddr, dst_ip, sizeof(dst_ip));
-
-        char protocol[8] = "OTHER";
-        int src_port = 0, dst_port = 0;
-
-        if (ip_header->protocol == IPPROTO_TCP) {
-            strcpy(protocol, "TCP");
-            struct tcphdr *tcp_header = (struct tcphdr *)(packet + ip_header->ihl * 4);
-            src_port = ntohs(tcp_header->source);
-            dst_port = ntohs(tcp_header->dest);
-        } else if (ip_header->protocol == IPPROTO_UDP) {
-                strcpy(protocol, "UDP");
-                struct udphdr *udp_header = (struct udphdr *)(packet + ip_header->ihl * 4);
-                src_port = ntohs(udp_header->source);
-                dst_port = ntohs(udp_header->dest);
-            } else {
-                strcpy(protocol, "OTHER");
-            }
-
-
-        printf("Processing packet: Src=%s, Dst=%s, Protocol=%s, SrcPort=%d, DstPort=%d\n",
-               src_ip, dst_ip, protocol, src_port, dst_port);
-
-        int action = check_rules(src_ip, dst_ip, src_port, dst_port, protocol);
-        if (action == 0) { // DROP
-            log_blocked_packet(src_ip, dst_ip, protocol, src_port, dst_port);
-            packets_blocked++;
-            printf("Packet blocked. Total blocked: %d\n", packets_blocked);
-            return nfq_set_verdict(queue_handle, id, NF_DROP, 0, NULL);
-        }
-        packets_accepted++;
-        printf("Packet accepted. Total accepted: %d\n", packets_accepted);
-    }
-
-    return nfq_set_verdict(queue_handle, id, NF_ACCEPT, 0, NULL);
-}
-
-#include <signal.h>
-
-void handle_sigint(int sig) {
-    save_statistics();
-    printf("\nFirewall interrompido.\n");
-    printf("Pacotes bloqueados: %d\n", packets_blocked);
-    printf("Pacotes aceitos: %d\n", packets_accepted);
-    exit(0);
-}
-
-
+// Função principal
 int main() {
     struct nfq_handle *handle;
     struct nfq_q_handle *queue_handle;
+    pthread_t menu_thread;
 
-    signal(SIGINT, handle_sigint); // Função para capturar Ctrl+C
+    signal(SIGINT, handle_sigint); // Captura Ctrl+C
 
     printf("Inicializando firewall...\n");
 
-    load_statistics(); // Carregar estatísticas salvas
+    load_statistics();
     load_rules();
+
+    if (pthread_create(&menu_thread, NULL, interactive_menu, NULL) != 0) {
+        perror("Erro ao criar thread do menu");
+        return EXIT_FAILURE;
+    }
 
     handle = nfq_open();
     if (!handle) {
@@ -249,8 +278,7 @@ int main() {
     nfq_destroy_queue(queue_handle);
     nfq_close(handle);
 
-    save_statistics(); // Salvar estatísticas antes de sair
-
+    save_statistics();
+    pthread_join(menu_thread, NULL);
     return 0;
 }
-
