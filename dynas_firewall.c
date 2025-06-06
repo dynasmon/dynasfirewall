@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <pthread.h>
+#include <getopt.h>
 #include <libnetfilter_queue/libnetfilter_queue.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
@@ -36,7 +37,7 @@ int firewall_running = 1; // Flag para indicar o estado do firewall
 Rule rules[MAX_RULES];
 
 // Declarações de funções
-void load_rules();
+void load_rules(const char *path);
 void save_statistics();
 void load_statistics();
 void log_blocked_packet(const char *src_ip, const char *dst_ip, const char *protocol, int src_port, int dst_port);
@@ -44,6 +45,9 @@ void handle_sigint(int sig);
 void *interactive_menu(void *arg);
 int check_rules(const char *src_ip, const char *dst_ip, int src_port, int dst_port, const char *protocol);
 static int process_packet(struct nfq_q_handle *queue_handle, struct nfgenmsg *msg, struct nfq_data *packet_data, void *data);
+void print_help(const char *prog);
+void list_rules();
+void add_rule_from_string(const char *rule);
 
 // Implementações de funções
 void load_statistics() {
@@ -61,6 +65,52 @@ void save_statistics() {
         fclose(file);
     } else {
         perror("Erro ao salvar estatísticas");
+    }
+}
+
+void log_blocked_packet(const char *src_ip, const char *dst_ip, const char *protocol, int src_port, int dst_port) {
+    FILE *log = fopen(LOG_FILE, "a");
+    if (log) {
+        char timestamp[20];
+        time_t now = time(NULL);
+        strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now));
+        fprintf(log, "%s Blocked %s:%d -> %s:%d (%s)\n", timestamp, src_ip, src_port, dst_ip, dst_port, protocol);
+        fclose(log);
+    }
+}
+
+void print_help(const char *prog) {
+    printf("Uso: %s [opcoes]\n", prog);
+    printf("  -h, --help           Mostra esta mensagem\n");
+    printf("  -c, --config <file>  Arquivo de configuracao das regras\n");
+    printf("  -l, --list           Lista regras e sai\n");
+    printf("  -a, --add \"regra\"   Adiciona regra no formato padrao\n");
+    printf("  -s, --stats          Mostra estatisticas e sai\n");
+    printf("      --no-menu        Nao inicia o menu interativo\n");
+}
+
+void list_rules() {
+    for (int i = 0; i < rule_count; i++) {
+        printf("%d. Src:%s Dst:%s SrcPort:%d DstPort:%d Proto:%s Action:%s Time:%s-%s\n",
+               i + 1, rules[i].src_ip, rules[i].dst_ip, rules[i].src_port,
+               rules[i].dst_port, rules[i].protocol,
+               rules[i].action ? "ACCEPT" : "DROP", rules[i].start_time, rules[i].end_time);
+    }
+}
+
+void add_rule_from_string(const char *rule) {
+    Rule r;
+    if (sscanf(rule, "%39s %39s %d %d %7s %d %5s %5s",
+               r.src_ip, r.dst_ip, &r.src_port, &r.dst_port,
+               r.protocol, &r.action, r.start_time, r.end_time) == 8) {
+        if (rule_count < MAX_RULES) {
+            rules[rule_count++] = r;
+            printf("Regra adicionada com sucesso.\n");
+        } else {
+            fprintf(stderr, "Numero maximo de regras atingido.\n");
+        }
+    } else {
+        fprintf(stderr, "Formato de regra invalido.\n");
     }
 }
 
@@ -148,22 +198,48 @@ void *interactive_menu(void *arg) {
 
 static int process_packet(struct nfq_q_handle *queue_handle, struct nfgenmsg *msg,
                           struct nfq_data *packet_data, void *data) {
-    unsigned char *packet;
+    unsigned char *payload = NULL;
     struct nfqnl_msg_packet_hdr *ph;
     int id = 0;
 
     ph = nfq_get_msg_packet_hdr(packet_data);
-    if (ph) {
+    if (ph)
         id = ntohl(ph->packet_id);
+
+    int len = nfq_get_payload(packet_data, &payload);
+    if (len >= (int)sizeof(struct iphdr)) {
+        struct iphdr *ip_header = (struct iphdr *)payload;
+        char src_ip[40], dst_ip[40], proto[8] = "*";
+        int src_port = 0, dst_port = 0;
+
+        inet_ntop(AF_INET, &ip_header->saddr, src_ip, sizeof(src_ip));
+        inet_ntop(AF_INET, &ip_header->daddr, dst_ip, sizeof(dst_ip));
+
+        if (ip_header->protocol == IPPROTO_TCP && len >= ip_header->ihl * 4 + (int)sizeof(struct tcphdr)) {
+            struct tcphdr *tcp = (struct tcphdr *)(payload + ip_header->ihl * 4);
+            src_port = ntohs(tcp->source);
+            dst_port = ntohs(tcp->dest);
+            strcpy(proto, "TCP");
+        } else if (ip_header->protocol == IPPROTO_UDP && len >= ip_header->ihl * 4 + (int)sizeof(struct udphdr)) {
+            struct udphdr *udp = (struct udphdr *)(payload + ip_header->ihl * 4);
+            src_port = ntohs(udp->source);
+            dst_port = ntohs(udp->dest);
+            strcpy(proto, "UDP");
+        } else if (ip_header->protocol == IPPROTO_ICMP) {
+            strcpy(proto, "ICMP");
+        }
+
+        int action = check_rules(src_ip, dst_ip, src_port, dst_port, proto);
+        if (!action) {
+            log_blocked_packet(src_ip, dst_ip, proto, src_port, dst_port);
+            packets_blocked++;
+        } else {
+            packets_accepted++;
+        }
+        return nfq_set_verdict(queue_handle, id, action == 0 ? NF_DROP : NF_ACCEPT, 0, NULL);
     }
 
-    struct iphdr *ip_header = (struct iphdr *)packet;
-    char src_ip[40], dst_ip[40];
-    inet_ntop(AF_INET, &ip_header->saddr, src_ip, sizeof(src_ip));
-    inet_ntop(AF_INET, &ip_header->daddr, dst_ip, sizeof(dst_ip));
-
-    int action = check_rules(src_ip, dst_ip, 0, 0, "TCP"); // Exemplo básico
-    return nfq_set_verdict(queue_handle, id, action == 0 ? NF_DROP : NF_ACCEPT, 0, NULL);
+    return nfq_set_verdict(queue_handle, id, NF_ACCEPT, 0, NULL);
 }
 
 void handle_sigint(int sig) {
@@ -174,8 +250,8 @@ void handle_sigint(int sig) {
     exit(0);
 }
 
-void load_rules() {
-    FILE *config = fopen(CONFIG_FILE, "r");
+void load_rules(const char *path) {
+    FILE *config = fopen(path, "r");
     if (!config) {
         perror("Erro ao abrir arquivo de configuração");
         return;
@@ -212,11 +288,6 @@ int check_rules(const char *src_ip, const char *dst_ip, int src_port, int dst_po
             (strcmp(current_time, rules[i].start_time) >= 0 && strcmp(current_time, rules[i].end_time) <= 0)) {
             return rules[i].action;
         }
-        printf("Comparando pacote: Src=%s, Dst=%s, SrcPort=%d, DstPort=%d, Protocol=%s\n",
-        src_ip, dst_ip, src_port, dst_port, protocol);
-        printf("Regra atual: Src=%s, Dst=%s, SrcPort=%d, DstPort=%d, Protocol=%s, Action=%d\n",
-        rules[i].src_ip, rules[i].dst_ip, rules[i].src_port, rules[i].dst_port,
-        rules[i].protocol, rules[i].action);
 
     }
     return 1; // Default: ACCEPT
@@ -224,21 +295,66 @@ int check_rules(const char *src_ip, const char *dst_ip, int src_port, int dst_po
 
 
 // Função principal
-int main() {
+int main(int argc, char *argv[]) {
     struct nfq_handle *handle;
     struct nfq_q_handle *queue_handle;
     pthread_t menu_thread;
+    const char *config_file = CONFIG_FILE;
+    int no_menu = 0;
+    int opt;
+
+    static struct option long_options[] = {
+        {"help",   no_argument,       0, 'h'},
+        {"config", required_argument, 0, 'c'},
+        {"list",   no_argument,       0, 'l'},
+        {"add",    required_argument, 0, 'a'},
+        {"stats",  no_argument,       0, 's'},
+        {"no-menu", no_argument,      0,  1 },
+        {0,0,0,0}
+    };
+
+    while ((opt = getopt_long(argc, argv, "hc:la:s", long_options, NULL)) != -1) {
+        switch (opt) {
+            case 'h':
+                print_help(argv[0]);
+                return 0;
+            case 'c':
+                config_file = optarg;
+                break;
+            case 'l':
+                load_rules(config_file);
+                list_rules();
+                return 0;
+            case 'a':
+                load_rules(config_file);
+                add_rule_from_string(optarg);
+                return 0;
+            case 's':
+                load_statistics();
+                printf("Pacotes bloqueados: %d\n", packets_blocked);
+                printf("Pacotes aceitos: %d\n", packets_accepted);
+                return 0;
+            case 1: // --no-menu
+                no_menu = 1;
+                break;
+            default:
+                print_help(argv[0]);
+                return 1;
+        }
+    }
 
     signal(SIGINT, handle_sigint); // Captura Ctrl+C
 
     printf("Inicializando firewall...\n");
 
     load_statistics();
-    load_rules();
+    load_rules(config_file);
 
-    if (pthread_create(&menu_thread, NULL, interactive_menu, NULL) != 0) {
-        perror("Erro ao criar thread do menu");
-        return EXIT_FAILURE;
+    if (!no_menu) {
+        if (pthread_create(&menu_thread, NULL, interactive_menu, NULL) != 0) {
+            perror("Erro ao criar thread do menu");
+            return EXIT_FAILURE;
+        }
     }
 
     handle = nfq_open();
@@ -279,6 +395,7 @@ int main() {
     nfq_close(handle);
 
     save_statistics();
-    pthread_join(menu_thread, NULL);
+    if (!no_menu)
+        pthread_join(menu_thread, NULL);
     return 0;
 }

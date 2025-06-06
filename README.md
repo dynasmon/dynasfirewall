@@ -43,9 +43,9 @@ To build and run DynasFirewall, you need the following dependencies installed on
    cd dynasfirewall
    ```
 
-2. Compile the source code:
+2. Compile the source code using `make`:
    ```bash
-   gcc -o firewall dynas_firewall.c -lnetfilter_queue
+   make
    ```
 
 3. Create or edit the configuration file:
@@ -67,9 +67,9 @@ To build and run DynasFirewall, you need the following dependencies installed on
    sudo iptables -A OUTPUT -j NFQUEUE --queue-num 0
    ```
 
-5. Run the firewall:
+5. Run the firewall (see `--help` for all options):
    ```bash
-   sudo ./firewall
+   sudo ./firewall --help
    ```
 
 ---
@@ -82,6 +82,7 @@ To build and run DynasFirewall, you need the following dependencies installed on
   ```bash
   tail -f /var/log/firewall.log
   ```
+- **Command-Line Options:** Use `./firewall --help` to list commands for adding rules, listing existing rules and showing statistics.
 - **Traffic Statistics:** Upon termination, the firewall displays the number of packets blocked and accepted.
 
 ---
