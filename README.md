@@ -131,9 +131,3 @@ This example demonstrates a configuration file with rules applied dynamically ba
 # Allow all ICMP traffic
 * * 0 0 ICMP 1 00:00 23:59
 ```
-
----
-
-## License
-
-This project is distributed under the MIT License. See the [LICENSE](LICENSE) file for details.
